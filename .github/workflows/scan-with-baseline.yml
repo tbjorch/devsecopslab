@@ -1,0 +1,94 @@
+name: image-vuln-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t app:${{ github.sha }} .
+
+      - name: Scan image (json)
+        run: |
+          trivy image --scanners vuln --format json -o trivy.json app:${{ github.sha }}
+
+      - name: Extract HIGH/CRITICAL fingerprints
+        run: |
+          jq -r '
+            [ .Results[]?
+              | .Vulnerabilities[]?
+              | select((.Severity=="HIGH") or (.Severity=="CRITICAL"))
+              | "\(.VulnerabilityID)|\(.PkgName)|\(.InstalledVersion)|\(.PkgPath // "")"
+            ] | unique | sort | .[]
+          ' trivy.json > current.txt
+
+      # ---------- PR: compare against baseline ----------
+      - name: Download baseline from latest successful main run
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          # Find latest successful run on main for this workflow
+          RUN_ID=$(gh api "repos/$REPO/actions/workflows/${{ github.workflow_ref }}" \
+            --jq '.id' 2>/dev/null || true)
+
+          # Fallback: list workflow runs by name (more robust)
+          RUN_JSON=$(gh api "repos/$REPO/actions/runs?branch=main&status=success&per_page=1")
+          BASE_RUN_ID=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].id')
+
+          # Download artifact named "vuln-baseline"
+          ART_JSON=$(gh api "repos/$REPO/actions/runs/$BASE_RUN_ID/artifacts")
+          ART_ID=$(echo "$ART_JSON" | jq -r '.artifacts[] | select(.name=="vuln-baseline") | .id' | head -n1)
+
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            echo "No baseline artifact found; allowing PR (first run)."
+            touch baseline.txt
+            exit 0
+          fi
+
+          gh api "repos/$REPO/actions/artifacts/$ART_ID/zip" > baseline.zip
+          unzip -o baseline.zip
+          test -f baseline.txt
+
+      - name: Fail only on NEW HIGH/CRITICAL
+        if: github.event_name == 'pull_request'
+        run: |
+          comm -13 baseline.txt current.txt > new.txt || true
+          if [ -s new.txt ]; then
+            echo "## ❌ New HIGH/CRITICAL vulns introduced" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat new.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "## ✅ No new HIGH/CRITICAL vulns vs baseline" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ---------- main: publish baseline ----------
+      - name: Prepare baseline artifact
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp current.txt baseline.txt
+          echo "## 📌 Updated baseline (HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat baseline.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          name: vuln-baseline
+          path: baseline.txt
+          retention-days: 30
