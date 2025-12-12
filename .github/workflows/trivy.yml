@@ -1,0 +1,61 @@
+name: security-scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # for SARIF upload
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          docker build -t app:${{ github.sha }} .
+
+      - name: Trivy repo scan (deps/IaC)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Upload repo SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: app:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Upload image SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Action summary (readable)
+        if: always()
+        run: |
+          echo "## Trivy findings (repo + image)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Repo scan (top findings)" >> $GITHUB_STEP_SUMMARY
+          trivy fs --severity HIGH,CRITICAL --format table . > trivy-fs.txt
+          head -n 200 trivy-fs.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Image scan (top findings)" >> $GITHUB_STEP_SUMMARY
+          trivy image --severity HIGH,CRITICAL --format table app:${{ github.sha }} > trivy-image.txt
+          head -n 200 trivy-image.txt >> "$GITHUB_STEP_SUMMARY"
