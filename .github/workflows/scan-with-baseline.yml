@@ -125,50 +125,57 @@ jobs:
             DIGEST_EXISTS="false"
           fi
 
+          SKIP_BASE_CHECK=false
           if [ "$DIGEST_EXISTS" = "true" ]; then
             echo "## ✅ Runtime digest already in production" >> $GITHUB_STEP_SUMMARY
             echo "Digest: \`$RUNTIME_DIGEST\`" >> $GITHUB_STEP_SUMMARY
-            echo "This digest is already deployed to production. Allowing PR." >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
+            echo "Base image vulnerabilities check skipped (same digest already in production)." >> $GITHUB_STEP_SUMMARY
+            echo "Still checking application dependencies for new vulnerabilities..." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            SKIP_BASE_CHECK=true
+            # Get app vulnerabilities from the existing digest entry
+            jq -r --arg digest "$RUNTIME_DIGEST" '.[$digest].app_vulns[]?' production-digests.json > prod-app-vulns.txt 2>/dev/null || true
+            # Base image check skipped, so use empty file
+            touch prod-base-vulns.txt
+          else
+            echo "## 🔍 New runtime digest detected" >> $GITHUB_STEP_SUMMARY
+            echo "Digest: \`$RUNTIME_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "## 🔍 New runtime digest detected" >> $GITHUB_STEP_SUMMARY
-          echo "Digest: \`$RUNTIME_DIGEST\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Get latest production vulnerabilities
-          if [ -f production-digests.json ]; then
-            # Get the most recent digest entry (last one in the object)
-            LATEST_DIGEST=$(jq -r 'to_entries | sort_by(.value.deployed_at) | reverse | .[0].key' production-digests.json)
-            if [ -n "$LATEST_DIGEST" ] && [ "$LATEST_DIGEST" != "null" ]; then
-              jq -r --arg digest "$LATEST_DIGEST" '.[$digest].base_vulns[]?' production-digests.json > prod-base-vulns.txt 2>/dev/null || true
-              jq -r --arg digest "$LATEST_DIGEST" '.[$digest].app_vulns[]?' production-digests.json > prod-app-vulns.txt 2>/dev/null || true
+            # Get latest production vulnerabilities for comparison
+            if [ -f production-digests.json ]; then
+              # Get the most recent digest entry (last one in the object)
+              LATEST_DIGEST=$(jq -r 'to_entries | sort_by(.value.deployed_at) | reverse | .[0].key' production-digests.json)
+              if [ -n "$LATEST_DIGEST" ] && [ "$LATEST_DIGEST" != "null" ]; then
+                jq -r --arg digest "$LATEST_DIGEST" '.[$digest].base_vulns[]?' production-digests.json > prod-base-vulns.txt 2>/dev/null || true
+                jq -r --arg digest "$LATEST_DIGEST" '.[$digest].app_vulns[]?' production-digests.json > prod-app-vulns.txt 2>/dev/null || true
+              else
+                touch prod-base-vulns.txt prod-app-vulns.txt
+              fi
             else
               touch prod-base-vulns.txt prod-app-vulns.txt
             fi
-          else
-            touch prod-base-vulns.txt prod-app-vulns.txt
           fi
 
           # Ensure files exist
           touch base-vulns.txt app-vulns.txt prod-base-vulns.txt prod-app-vulns.txt
 
-          # Compare base image vulnerabilities
-          comm -13 <(sort prod-base-vulns.txt) <(sort base-vulns.txt) > new-base-vulns.txt || true
-
-          # Compare app dependencies vulnerabilities
-          comm -13 <(sort prod-app-vulns.txt) <(sort app-vulns.txt) > new-app-vulns.txt || true
-
           BLOCK=false
 
-          if [ -s new-base-vulns.txt ]; then
-            echo "### ❌ New HIGH/CRITICAL vulnerabilities in base image" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat new-base-vulns.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            BLOCK=true
+          # Compare base image vulnerabilities (only if digest is new)
+          if [ "$SKIP_BASE_CHECK" = "false" ]; then
+            comm -13 <(sort prod-base-vulns.txt) <(sort base-vulns.txt) > new-base-vulns.txt || true
+            if [ -s new-base-vulns.txt ]; then
+              echo "### ❌ New HIGH/CRITICAL vulnerabilities in base image" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              cat new-base-vulns.txt >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              BLOCK=true
+            fi
           fi
 
+          # Always compare app dependencies vulnerabilities
+          comm -13 <(sort prod-app-vulns.txt) <(sort app-vulns.txt) > new-app-vulns.txt || true
           if [ -s new-app-vulns.txt ]; then
             echo "### ❌ New HIGH/CRITICAL vulnerabilities in application dependencies" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
@@ -182,8 +189,13 @@ jobs:
             echo "**PR blocked due to new HIGH/CRITICAL vulnerabilities.**" >> $GITHUB_STEP_SUMMARY
             exit 1
           else
-            echo "### ✅ No new HIGH/CRITICAL vulnerabilities" >> $GITHUB_STEP_SUMMARY
-            echo "Base image and application dependencies have no new HIGH/CRITICAL vulnerabilities compared to production." >> $GITHUB_STEP_SUMMARY
+            if [ "$SKIP_BASE_CHECK" = "true" ]; then
+              echo "### ✅ No new HIGH/CRITICAL vulnerabilities in application dependencies" >> $GITHUB_STEP_SUMMARY
+              echo "Base image check skipped (same digest already in production)." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "### ✅ No new HIGH/CRITICAL vulnerabilities" >> $GITHUB_STEP_SUMMARY
+              echo "Base image and application dependencies have no new HIGH/CRITICAL vulnerabilities compared to production." >> $GITHUB_STEP_SUMMARY
+            fi
           fi
 
       # ---------- main: update production digest registry ----------
