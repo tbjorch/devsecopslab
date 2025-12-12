@@ -19,8 +19,13 @@ jobs:
         run: docker build -t app:${{ github.sha }} .
 
       - name: Scan image (json)
-        run: |
-          trivy image --scanners vuln --format json -o trivy.json app:${{ github.sha }}
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: github
+          output: trivy.json
+          severity: HIGH,CRITICAL
 
       - name: Extract HIGH/CRITICAL fingerprints
         run: |
