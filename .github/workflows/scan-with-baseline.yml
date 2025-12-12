@@ -15,30 +15,69 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Extract runtime image digest from Dockerfile
+        id: extract-digest
+        run: |
+          # Try to find runtime image (distroless) digest
+          RUNTIME_DIGEST=$(grep -E "^FROM.*distroless" Dockerfile | grep -oE "sha256:[a-f0-9]{64}" | head -1)
+          if [ -z "$RUNTIME_DIGEST" ]; then
+            # Fallback: find the last FROM statement (should be runtime stage)
+            RUNTIME_DIGEST=$(grep "^FROM" Dockerfile | tail -1 | grep -oE "sha256:[a-f0-9]{64}")
+          fi
+          if [ -z "$RUNTIME_DIGEST" ]; then
+            echo "Error: Could not extract runtime image digest from Dockerfile"
+            exit 1
+          fi
+          echo "digest=$RUNTIME_DIGEST" >> $GITHUB_OUTPUT
+          echo "Runtime digest: $RUNTIME_DIGEST"
+
       - name: Build image
         run: docker build -t app:${{ github.sha }} .
 
       - name: Scan image (json)
         uses: aquasecurity/trivy-action@0.33.1
         with:
-          scan-type: fs
-          scan-ref: .
-          format: github
+          image-ref: app:${{ github.sha }}
+          format: json
           output: trivy.json
           severity: HIGH,CRITICAL
 
-      - name: Extract HIGH/CRITICAL fingerprints
+      - name: Separate base image and app vulnerabilities
         run: |
+          # Extract all HIGH/CRITICAL vulnerabilities
           jq -r '
             [ .Results[]?
               | .Vulnerabilities[]?
               | select((.Severity=="HIGH") or (.Severity=="CRITICAL"))
               | "\(.VulnerabilityID)|\(.PkgName)|\(.InstalledVersion)|\(.PkgPath // "")"
             ] | unique | sort | .[]
-          ' trivy.json > current.txt
+          ' trivy.json > all-vulns.txt
 
-      # ---------- PR: compare against baseline ----------
-      - name: Download baseline from latest successful main run
+          # Base image vulnerabilities: packages NOT in node_modules
+          jq -r '
+            [ .Results[]?
+              | .Vulnerabilities[]?
+              | select((.Severity=="HIGH") or (.Severity=="CRITICAL"))
+              | select((.PkgPath // "") | test("node_modules") | not)
+              | "\(.VulnerabilityID)|\(.PkgName)|\(.InstalledVersion)|\(.PkgPath // "")"
+            ] | unique | sort | .[]
+          ' trivy.json > base-vulns.txt
+
+          # Application dependencies: packages in node_modules
+          jq -r '
+            [ .Results[]?
+              | .Vulnerabilities[]?
+              | select((.Severity=="HIGH") or (.Severity=="CRITICAL"))
+              | select((.PkgPath // "") | test("node_modules"))
+              | "\(.VulnerabilityID)|\(.PkgName)|\(.InstalledVersion)|\(.PkgPath // "")"
+            ] | unique | sort | .[]
+          ' trivy.json > app-vulns.txt
+
+          # Create empty files if no vulnerabilities found
+          touch base-vulns.txt app-vulns.txt
+
+      # ---------- PR: check digest and compare vulnerabilities ----------
+      - name: Download production digest registry
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,54 +85,167 @@ jobs:
         run: |
           set -e
           # Find latest successful run on main for this workflow
-          RUN_ID=$(gh api "repos/$REPO/actions/workflows/${{ github.workflow_ref }}" \
-            --jq '.id' 2>/dev/null || true)
+          RUN_JSON=$(gh api "repos/$REPO/actions/runs?branch=main&status=success&per_page=1" 2>/dev/null || echo '{"workflow_runs":[]}')
+          BASE_RUN_ID=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].id // empty')
 
-          # Fallback: list workflow runs by name (more robust)
-          RUN_JSON=$(gh api "repos/$REPO/actions/runs?branch=main&status=success&per_page=1")
-          BASE_RUN_ID=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].id')
-
-          # Download artifact named "vuln-baseline"
-          ART_JSON=$(gh api "repos/$REPO/actions/runs/$BASE_RUN_ID/artifacts")
-          ART_ID=$(echo "$ART_JSON" | jq -r '.artifacts[] | select(.name=="vuln-baseline") | .id' | head -n1)
-
-          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
-            echo "No baseline artifact found; allowing PR (first run)."
-            touch baseline.txt
+          if [ -z "$BASE_RUN_ID" ] || [ "$BASE_RUN_ID" = "null" ]; then
+            echo "No successful main run found; allowing PR (first run)."
+            echo '{}' > production-digests.json
             exit 0
           fi
 
-          gh api "repos/$REPO/actions/artifacts/$ART_ID/zip" > baseline.zip
-          unzip -o baseline.zip
-          test -f baseline.txt
+          # Download artifact named "production-digests"
+          ART_JSON=$(gh api "repos/$REPO/actions/runs/$BASE_RUN_ID/artifacts" 2>/dev/null || echo '{"artifacts":[]}')
+          ART_ID=$(echo "$ART_JSON" | jq -r '.artifacts[] | select(.name=="production-digests") | .id' | head -n1)
 
-      - name: Fail only on NEW HIGH/CRITICAL
-        if: github.event_name == 'pull_request'
-        run: |
-          comm -13 baseline.txt current.txt > new.txt || true
-          if [ -s new.txt ]; then
-            echo "## ❌ New HIGH/CRITICAL vulns introduced" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat new.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 1
-          else
-            echo "## ✅ No new HIGH/CRITICAL vulns vs baseline" >> $GITHUB_STEP_SUMMARY
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            echo "No production-digests artifact found; allowing PR (first run)."
+            echo '{}' > production-digests.json
+            exit 0
           fi
 
-      # ---------- main: publish baseline ----------
-      - name: Prepare baseline artifact
-        if: github.ref == 'refs/heads/main'
+          gh api "repos/$REPO/actions/artifacts/$ART_ID/zip" > registry.zip
+          unzip -o registry.zip
+          if [ ! -f production-digests.json ]; then
+            echo "Artifact downloaded but production-digests.json not found; creating empty registry."
+            echo '{}' > production-digests.json
+          fi
+
+      - name: Check digest and compare vulnerabilities
+        if: github.event_name == 'pull_request'
+        env:
+          RUNTIME_DIGEST: ${{ steps.extract-digest.outputs.digest }}
         run: |
-          cp current.txt baseline.txt
-          echo "## 📌 Updated baseline (HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
+          set -e
+
+          # Check if digest exists in production
+          if [ -f production-digests.json ]; then
+            DIGEST_EXISTS=$(jq -r --arg digest "$RUNTIME_DIGEST" 'has($digest)' production-digests.json)
+          else
+            DIGEST_EXISTS="false"
+          fi
+
+          if [ "$DIGEST_EXISTS" = "true" ]; then
+            echo "## ✅ Runtime digest already in production" >> $GITHUB_STEP_SUMMARY
+            echo "Digest: \`$RUNTIME_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+            echo "This digest is already deployed to production. Allowing PR." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "## 🔍 New runtime digest detected" >> $GITHUB_STEP_SUMMARY
+          echo "Digest: \`$RUNTIME_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get latest production vulnerabilities
+          if [ -f production-digests.json ]; then
+            # Get the most recent digest entry (last one in the object)
+            LATEST_DIGEST=$(jq -r 'to_entries | sort_by(.value.deployed_at) | reverse | .[0].key' production-digests.json)
+            if [ -n "$LATEST_DIGEST" ] && [ "$LATEST_DIGEST" != "null" ]; then
+              jq -r --arg digest "$LATEST_DIGEST" '.[$digest].base_vulns[]?' production-digests.json > prod-base-vulns.txt 2>/dev/null || true
+              jq -r --arg digest "$LATEST_DIGEST" '.[$digest].app_vulns[]?' production-digests.json > prod-app-vulns.txt 2>/dev/null || true
+            else
+              touch prod-base-vulns.txt prod-app-vulns.txt
+            fi
+          else
+            touch prod-base-vulns.txt prod-app-vulns.txt
+          fi
+
+          # Ensure files exist
+          touch base-vulns.txt app-vulns.txt prod-base-vulns.txt prod-app-vulns.txt
+
+          # Compare base image vulnerabilities
+          comm -13 <(sort prod-base-vulns.txt) <(sort base-vulns.txt) > new-base-vulns.txt || true
+
+          # Compare app dependencies vulnerabilities
+          comm -13 <(sort prod-app-vulns.txt) <(sort app-vulns.txt) > new-app-vulns.txt || true
+
+          BLOCK=false
+
+          if [ -s new-base-vulns.txt ]; then
+            echo "### ❌ New HIGH/CRITICAL vulnerabilities in base image" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat new-base-vulns.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            BLOCK=true
+          fi
+
+          if [ -s new-app-vulns.txt ]; then
+            echo "### ❌ New HIGH/CRITICAL vulnerabilities in application dependencies" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat new-app-vulns.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            BLOCK=true
+          fi
+
+          if [ "$BLOCK" = "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**PR blocked due to new HIGH/CRITICAL vulnerabilities.**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "### ✅ No new HIGH/CRITICAL vulnerabilities" >> $GITHUB_STEP_SUMMARY
+            echo "Base image and application dependencies have no new HIGH/CRITICAL vulnerabilities compared to production." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ---------- main: update production digest registry ----------
+      - name: Update production digest registry
+        if: github.ref == 'refs/heads/main'
+        env:
+          RUNTIME_DIGEST: ${{ steps.extract-digest.outputs.digest }}
+        run: |
+          set -e
+
+          # Download existing registry if available
+          RUN_JSON=$(gh api "repos/${{ github.repository }}/actions/runs?branch=main&status=success&per_page=1" 2>/dev/null || echo '{"workflow_runs":[]}')
+          BASE_RUN_ID=$(echo "$RUN_JSON" | jq -r '.workflow_runs[0].id // empty')
+
+          if [ -n "$BASE_RUN_ID" ] && [ "$BASE_RUN_ID" != "null" ]; then
+            ART_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/$BASE_RUN_ID/artifacts" 2>/dev/null || echo '{"artifacts":[]}')
+            ART_ID=$(echo "$ART_JSON" | jq -r '.artifacts[] | select(.name=="production-digests") | .id' | head -n1)
+
+            if [ -n "$ART_ID" ] && [ "$ART_ID" != "null" ]; then
+              gh api "repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip" > registry.zip 2>/dev/null || true
+              if [ -f registry.zip ]; then
+                unzip -o registry.zip 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          # Load existing registry or create new one
+          if [ -f production-digests.json ]; then
+            REGISTRY=$(cat production-digests.json)
+          else
+            REGISTRY='{}'
+          fi
+
+          # Read vulnerability fingerprints
+          BASE_VULNS=$(cat base-vulns.txt | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          APP_VULNS=$(cat app-vulns.txt | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          # Update registry with current digest
+          UPDATED_REGISTRY=$(echo "$REGISTRY" | jq --arg digest "$RUNTIME_DIGEST" \
+            --argjson base "$BASE_VULNS" \
+            --argjson app "$APP_VULNS" \
+            --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '. + {($digest): {base_vulns: $base, app_vulns: $app, deployed_at: $deployed_at}}')
+
+          echo "$UPDATED_REGISTRY" > production-digests.json
+
+          echo "## 📌 Updated production digest registry" >> $GITHUB_STEP_SUMMARY
+          echo "Digest: \`$RUNTIME_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Base image vulnerabilities (HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          cat baseline.txt >> $GITHUB_STEP_SUMMARY
+          cat base-vulns.txt >> $GITHUB_STEP_SUMMARY || echo "(none)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Application dependencies vulnerabilities (HIGH/CRITICAL)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat app-vulns.txt >> $GITHUB_STEP_SUMMARY || echo "(none)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         if: github.ref == 'refs/heads/main'
         with:
-          name: vuln-baseline
-          path: baseline.txt
+          name: production-digests
+          path: production-digests.json
           retention-days: 30
