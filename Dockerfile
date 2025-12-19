@@ -1,5 +1,5 @@
 # ---- build (has npm/yarn/pnpm etc as you like) ----
-FROM node:25-alpine@sha256:fd164609b5ab0c6d49bac138ae06c347e72261ec6ae1de32b6aa9f5ee2271110 AS build
+FROM node:25-alpine@sha256:f4769ca6eeb6ebbd15eb9c8233afed856e437b75f486f7fccaa81d7c8ad56007 AS build
 WORKDIR /app
 
 COPY package.json yarn.lock ./
@@ -8,7 +8,7 @@ COPY . .
 RUN yarn build
 
 # ---- prod deps (still uses yarn, but not shipped) ----
-FROM node:25-alpine@sha256:fd164609b5ab0c6d49bac138ae06c347e72261ec6ae1de32b6aa9f5ee2271110 AS deps
+FROM node:25-alpine@sha256:f4769ca6eeb6ebbd15eb9c8233afed856e437b75f486f7fccaa81d7c8ad56007 AS deps
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json yarn.lock ./
